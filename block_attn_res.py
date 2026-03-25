@@ -83,30 +83,17 @@ def block_attn_res(
     partial_block: torch.Tensor,   # [B, T, D] — current intra-block sum
     proj: nn.Linear,               # [1, D] or [D] — query projection
     norm: RMSNorm,                 # key normalisation
+    damage_proj: nn.Linear = None, # optional: damage gate projection
+    damage_out: nn.Linear = None,  # optional: damage gate output
 ) -> torch.Tensor:
     """
-    Inter-block attention: attend over block representations + partial sum.
+    Inter-block attention with optional damage gating.
 
-    This is the *state-based peridynamic integral* over the depth dimension.
-    Each completed block is a "material point" in depth-space.  The partial
-    sum is the current "deformation state" being integrated.
-
-    The attention computes:
-        h = Σ_j  softmax(proj · RMSNorm(V_j))_j  ·  V_j
-
-    where V = [block_0, block_1, ..., block_{N-1}, partial_block].
-
-    This is a learned, adaptive weighted combination of all previous block
-    summaries, replacing the simple additive residual stream.
-
-    Args:
-        blocks:        List of N completed block representations [B, T, D]
-        partial_block: Current intra-block partial sum [B, T, D]
-        proj:          Learned query projection (scalar attention)
-        norm:          RMSNorm for key computation
-
-    Returns:
-        h: [B, T, D] — weighted combination of all blocks + partial
+    Without damage: standard softmax-weighted sum over all blocks.
+    With damage: blocks whose "strain" (difference from current partial)
+    exceeds a learned threshold are suppressed. This prevents cross-domain
+    contamination — old block summaries from a different domain don't
+    pollute the current computation.
     """
     # Stack: [N+1, B, T, D]
     V = torch.stack(blocks + [partial_block])
@@ -114,10 +101,21 @@ def block_attn_res(
     # Keys: normalised representations
     K = norm(V)                                            # [N+1, B, T, D]
 
-    # Scalar attention logits: project each key to a scalar
-    # proj.weight is [1, D] or [D] — dot product with each key
+    # Scalar attention logits
     w = proj.weight.squeeze()                              # [D]
     logits = torch.einsum('d, n b t d -> n b t', w, K)    # [N+1, B, T]
+
+    # Damage gating: suppress blocks that are too different from current partial
+    if damage_proj is not None and damage_out is not None:
+        partial_normed = norm(partial_block)               # [B, T, D]
+        # "Strain" between each block and current partial
+        block_strain = K - partial_normed.unsqueeze(0)     # [N+1, B, T, D]
+        # Project strain to damage score
+        damage_act = F.gelu(damage_proj(block_strain))     # [N+1, B, T, D']
+        damage = torch.sigmoid(damage_out(damage_act))     # [N+1, B, T, 1]
+        damage = damage.squeeze(-1)                        # [N+1, B, T]
+        # Suppress high-damage (cross-domain) blocks
+        logits = logits - damage * 10.0
 
     # Softmax over the block dimension (dim=0)
     weights = logits.softmax(dim=0)                        # [N+1, B, T]
@@ -173,6 +171,9 @@ class BlockAttnResLayer(nn.Module):
         if attn_type == 'peridynamic':
             from model import PeriDynamicAttention
             self.attn = PeriDynamicAttention(config)
+        elif attn_type == 'state_peridynamic':
+            from model import StatePeriDynamicAttention
+            self.attn = StatePeriDynamicAttention(config)
         elif attn_type == 'hybrid':
             from model import HybridPeriAttention
             self.attn = HybridPeriAttention(config)
@@ -186,16 +187,27 @@ class BlockAttnResLayer(nn.Module):
         self.mlp = MLP(config)
 
         # Block attention residual projections
-        # Each is a [1, D] linear that produces scalar logits for block attention
         self.attn_res_proj = nn.Linear(D, 1, bias=False)
         self.attn_res_norm = RMSNorm(D)
         self.mlp_res_proj  = nn.Linear(D, 1, bias=False)
         self.mlp_res_norm  = RMSNorm(D)
 
-        # Is this layer a block boundary?
-        # block_size counts attn+mlp as 2 sub-layers per transformer layer
-        # So layer l is a block boundary when l % (depth_block_size // 2) == 0
-        # But for simplicity: every depth_block_size layers = 1 block
+        # Damage gating for block attention (suppresses cross-domain blocks)
+        self.use_block_damage = getattr(config, 'block_damage', False)
+        if self.use_block_damage:
+            damage_bd = max(D // 4, 32)
+            self.attn_damage_proj = nn.Linear(D, damage_bd, bias=True)
+            self.attn_damage_out = nn.Linear(damage_bd, 1, bias=True)
+            nn.init.constant_(self.attn_damage_out.bias, -3.0)
+            self.mlp_damage_proj = nn.Linear(D, damage_bd, bias=True)
+            self.mlp_damage_out = nn.Linear(damage_bd, 1, bias=True)
+            nn.init.constant_(self.mlp_damage_out.bias, -3.0)
+        else:
+            self.attn_damage_proj = None
+            self.attn_damage_out = None
+            self.mlp_damage_proj = None
+            self.mlp_damage_out = None
+
         self.is_block_boundary = (
             (layer_idx + 1) % self.depth_block_size == 0
         )
@@ -217,7 +229,8 @@ class BlockAttnResLayer(nn.Module):
         # ── Apply block attn-res before attention ──
         h = block_attn_res(
             blocks, partial_block,
-            self.attn_res_proj, self.attn_res_norm)
+            self.attn_res_proj, self.attn_res_norm,
+            self.attn_damage_proj, self.attn_damage_out)
 
         # ── Self-attention ──
         attn_out = self.attn(self.attn_norm(h))
@@ -226,17 +239,16 @@ class BlockAttnResLayer(nn.Module):
         # ── Apply block attn-res before MLP ──
         h = block_attn_res(
             blocks, partial_block,
-            self.mlp_res_proj, self.mlp_res_norm)
+            self.mlp_res_proj, self.mlp_res_norm,
+            self.mlp_damage_proj, self.mlp_damage_out)
 
         # ── MLP ──
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = partial_block + mlp_out
 
-        # ── Block boundary: snapshot and reset ──
+        # ── Block boundary: snapshot ──
         if self.is_block_boundary:
             blocks = blocks + [partial_block]
-            # Don't reset partial to zero — let it accumulate
-            # (the block_attn_res will learn to weight old vs new)
 
         return blocks, partial_block
 

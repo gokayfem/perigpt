@@ -162,8 +162,9 @@ class PeriDynamicAttention(nn.Module):
         self.dropout   = config.dropout
 
         hs = self.head_size
-        # Reduced bond dimension — keeps strain tensors small
-        self.bond_dim = max(hs // 4, 16)
+        # Bond dimension — controls strain representation capacity
+        bond_dim_ratio = getattr(config, 'bond_dim_ratio', 4)
+        self.bond_dim = max(hs // bond_dim_ratio, 16)
         bd = self.bond_dim
 
         # ---------- projections ----------
@@ -382,6 +383,167 @@ class HybridPeriAttention(nn.Module):
         return local_out * (1 - alpha) + global_out * alpha
 
 # ---------------------------------------------------------------------------
+# State-Based Peridynamic Attention (the richer formulation)
+# ---------------------------------------------------------------------------
+
+class StatePeriDynamicAttention(nn.Module):
+    """
+    State-based peridynamic attention.
+
+    Unlike bond-based (PeriDynamicAttention) where score(i,j) depends only on
+    the pairwise strain h_j - h_i, state-based first aggregates each token's
+    ENTIRE neighborhood into a "deformation state", then interactions depend
+    on both tokens' states plus the bond strain.
+
+    This is strictly more expressive: the same pair of tokens interacts
+    differently depending on what surrounds each of them. In language terms,
+    "my attention to you depends on what else I'm attending to."
+
+    In mechanics: bond-based can only represent pair potentials. State-based
+    can represent constitutive laws that depend on the full deformation
+    (like Poisson ratio effects).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_size = config.n_embd // config.n_head
+        self.horizon = getattr(config, 'horizon', 32)
+        self.dropout = config.dropout
+
+        hs = self.head_size
+        bond_dim_ratio = getattr(config, 'bond_dim_ratio', 4)
+        self.bond_dim = max(hs // bond_dim_ratio, 16)
+        bd = self.bond_dim
+
+        # Projections
+        self.W_disp = nn.Linear(config.n_embd, config.n_head * bd, bias=config.bias)
+        self.W_val = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Relative position embedding
+        self.rel_pos_emb = nn.Embedding(self.horizon, bd)
+
+        # State aggregation: project strains before averaging
+        self.state_proj = nn.Linear(bd, bd, bias=config.bias)
+
+        # Bond score depends on: strain + state_i + state_j + position
+        self.strain_proj = nn.Linear(bd, bd, bias=config.bias)
+        self.state_i_proj = nn.Linear(bd, bd, bias=False)
+        self.state_j_proj = nn.Linear(bd, bd, bias=False)
+        self.pos_proj = nn.Linear(bd, bd, bias=False)
+        self.bond_out = nn.Linear(bd, 1, bias=config.bias)
+
+        # Damage (same as bond-based, but now state-informed)
+        self.damage_proj = nn.Linear(bd, bd, bias=True)
+        self.damage_out = nn.Linear(bd, 1, bias=True)
+        nn.init.constant_(self.damage_out.bias, -3.0)
+
+        # Output
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def _build_windows(self, tensor, delta):
+        padded = F.pad(tensor, (0, 0, delta - 1, 0))
+        win = padded.unfold(2, delta, 1)
+        return win.permute(0, 1, 2, 4, 3)
+
+    def _causal_mask(self, T, delta, device):
+        t_idx = torch.arange(T, device=device).unsqueeze(1)
+        w_idx = torch.arange(delta, device=device).unsqueeze(0)
+        return (t_idx - delta + 1 + w_idx) >= 0
+
+    def forward(self, x):
+        B, T, C = x.size()
+        nh = self.n_head
+        hs = self.head_size
+        bd = self.bond_dim
+        delta = min(self.horizon, T)
+
+        # Project to displacement and value spaces
+        disp = self.W_disp(x).view(B, T, nh, bd).permute(0, 2, 1, 3)
+        val = self.W_val(x).view(B, T, nh, hs).permute(0, 2, 1, 3)
+
+        # Build causal windows
+        disp_win = self._build_windows(disp, delta)
+        val_win = self._build_windows(val, delta)
+        cmask = self._causal_mask(T, delta, x.device)
+
+        # Strain: relative deformation
+        disp_i = disp.unsqueeze(3)
+        strain = disp_win - disp_i  # (B, nh, T, delta, bd)
+
+        # === STATE AGGREGATION ===
+        # Each token summarizes its neighborhood's deformation pattern
+        strain_for_state = self.state_proj(strain)  # (B, nh, T, delta, bd)
+        cmask_f = cmask.float().unsqueeze(0).unsqueeze(0)  # (1, 1, T, delta)
+        valid_counts = cmask_f.sum(dim=-1).clamp(min=1.0)  # (1, 1, T)
+        # Masked mean over horizon: mask strain, sum over delta dim, divide by count
+        masked_strain = strain_for_state * cmask_f.unsqueeze(-1)  # (B, nh, T, delta, bd)
+        state = masked_strain.sum(dim=3) / valid_counts.unsqueeze(-1)  # (B, nh, T, bd)
+        # state: (B, nh, T, bd) — each token's "deformation state"
+
+        # Build state windows (so we can look up neighbor states)
+        state_win = self._build_windows(state, delta)  # (B, nh, T, delta, bd)
+
+        # Relative position embedding
+        rel_ids = torch.arange(delta, device=x.device)
+        rel_emb = self.rel_pos_emb(rel_ids)
+
+        # === BOND SCORE: depends on strain + BOTH states + position ===
+        state_i = state.unsqueeze(3)  # (B, nh, T, 1, bd) — broadcasts over delta
+        bond_act = F.gelu(
+            self.strain_proj(strain)
+            + self.state_i_proj(state_i)
+            + self.state_j_proj(state_win)
+            + self.pos_proj(rel_emb)
+        )
+        bond_logits = self.bond_out(bond_act).squeeze(-1)  # (B, nh, T, delta)
+
+        # Damage
+        damage_act = F.gelu(self.damage_proj(strain))
+        damage = torch.sigmoid(self.damage_out(damage_act).squeeze(-1))
+        bond_logits = bond_logits - damage * 10.0
+
+        # Causal mask
+        bond_logits = bond_logits.masked_fill(
+            ~cmask.unsqueeze(0).unsqueeze(0), float('-inf')
+        )
+
+        # Softmax + aggregate
+        weights = F.softmax(bond_logits, dim=-1)
+        weights = self.attn_dropout(weights)
+        output = torch.einsum('bntd,bntde->bnte', weights, val_win)
+
+        output = output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
+        output = self.resid_dropout(self.c_proj(output))
+        return output
+
+    def get_damage_stats(self, x):
+        """Return mean damage for diagnostics."""
+        B, T, C = x.size()
+        bd = self.bond_dim
+        delta = min(self.horizon, T)
+        nh = self.n_head
+
+        disp = self.W_disp(x).view(B, T, nh, bd).permute(0, 2, 1, 3)
+        disp_win = self._build_windows(disp, delta)
+        strain = disp_win - disp.unsqueeze(3)
+
+        damage_act = F.gelu(self.damage_proj(strain))
+        damage = torch.sigmoid(self.damage_out(damage_act).squeeze(-1))
+        cmask = self._causal_mask(T, delta, x.device).float()
+        valid_count = cmask.sum()
+        mean_damage = (damage * cmask.unsqueeze(0).unsqueeze(0)).sum() / (
+            valid_count * B * nh + 1e-8
+        )
+        return mean_damage.item()
+
+
+# ---------------------------------------------------------------------------
 # Feed-Forward (MLP) — unchanged from nanoGPT
 # ---------------------------------------------------------------------------
 
@@ -414,6 +576,8 @@ class Block(nn.Module):
         attn_type = getattr(config, 'attention_type', 'standard')
         if attn_type == 'peridynamic':
             self.attn = PeriDynamicAttention(config)
+        elif attn_type == 'state_peridynamic':
+            self.attn = StatePeriDynamicAttention(config)
         elif attn_type == 'hybrid':
             self.attn = HybridPeriAttention(config)
         else:
@@ -442,13 +606,15 @@ class GPTConfig:
     bias:      bool = True
 
     # --- peridynamic extensions ---
-    attention_type:   str = 'standard'   # 'standard' | 'peridynamic' | 'hybrid'
+    attention_type:   str = 'standard'   # 'standard' | 'peridynamic' | 'hybrid' | 'state_peridynamic'
     horizon:          int = 32           # δ — neighbourhood size for peridynamic attn
     n_global_anchors: int = 8            # number of global "tendon" tokens (hybrid only)
+    bond_dim_ratio:   int = 4            # bond_dim = head_size // bond_dim_ratio (lower = more capacity)
 
     # --- block attention residual (state-based peridynamics over depth) ---
     residual_type:    str = 'standard'   # 'standard' | 'block_attn'
     depth_block_size: int = 4            # layers per block for block_attn residual
+    block_damage:    bool = False        # enable damage gating in block_attn_res
 
     # --- DEER layer-parallel extensions ---
     deer_enabled:     bool = False       # enable DEER-parallel forward pass
