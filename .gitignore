@@ -5,3 +5,7 @@ __pycache__/
 out-*/
 wandb/
 .DS_Store
+results.tsv
+data/*/input.txt
+data/*/*.pkl
+data/mixed_domain/*_raw.txt
