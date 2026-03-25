@@ -82,6 +82,59 @@ class LayerNorm(nn.Module):
 # Standard Causal Self-Attention (unchanged from nanoGPT)
 # ---------------------------------------------------------------------------
 
+class SlidingWindowAttention(nn.Module):
+    """
+    Standard Q*K^T attention with a causal sliding window mask.
+    Equivalent to Longformer local attention / Mistral sliding window.
+
+    This is the critical ablation baseline: same bounded horizon as
+    PeriDynamicAttention, but using standard dot-product scoring instead
+    of strain-based scoring, and NO damage mechanism. If peridynamic
+    attention outperforms this, the improvement comes from strain/damage,
+    not just the bounded window.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_size = config.n_embd // config.n_head
+        self.dropout = config.dropout
+        self.window_size = getattr(config, 'horizon', 32)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        nh = self.n_head
+        hs = self.head_size
+        W = min(self.window_size, T)
+
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, nh, hs).transpose(1, 2)
+        k = k.view(B, T, nh, hs).transpose(1, 2)
+        v = v.view(B, T, nh, hs).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
+
+        # Causal + sliding window mask
+        i_idx = torch.arange(T, device=x.device).unsqueeze(1)
+        j_idx = torch.arange(T, device=x.device).unsqueeze(0)
+        mask = (j_idx <= i_idx) & (i_idx - j_idx < W)
+        att = att.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -580,6 +633,8 @@ class Block(nn.Module):
             self.attn = StatePeriDynamicAttention(config)
         elif attn_type == 'hybrid':
             self.attn = HybridPeriAttention(config)
+        elif attn_type == 'sliding_window':
+            self.attn = SlidingWindowAttention(config)
         else:
             self.attn = CausalSelfAttention(config)
 
@@ -606,13 +661,13 @@ class GPTConfig:
     bias:      bool = True
 
     # --- peridynamic extensions ---
-    attention_type:   str = 'standard'   # 'standard' | 'peridynamic' | 'hybrid' | 'state_peridynamic'
+    attention_type:   str = 'standard'   # 'standard' | 'peridynamic' | 'state_peridynamic' | 'hybrid' | 'sliding_window'
     horizon:          int = 32           # δ — neighbourhood size for peridynamic attn
     n_global_anchors: int = 8            # number of global "tendon" tokens (hybrid only)
     bond_dim_ratio:   int = 4            # bond_dim = head_size // bond_dim_ratio (lower = more capacity)
 
     # --- block attention residual (state-based peridynamics over depth) ---
-    residual_type:    str = 'standard'   # 'standard' | 'block_attn'
+    residual_type:    str = 'standard'   # 'standard' | 'block_attn' | 'kimi_attn_res' | 'denseformer'
     depth_block_size: int = 4            # layers per block for block_attn residual
     block_damage:    bool = False        # enable damage gating in block_attn_res
 
@@ -671,12 +726,24 @@ class GPT(nn.Module):
 
     @staticmethod
     def _make_layers(config):
-        """Create layer stack: standard Blocks or BlockAttnResLayers."""
+        """Create layer stack based on residual_type."""
         residual_type = getattr(config, 'residual_type', 'standard')
         if residual_type == 'block_attn':
             from block_attn_res import BlockAttnResLayer
             return nn.ModuleList([
                 BlockAttnResLayer(config, layer_idx=i)
+                for i in range(config.n_layer)
+            ])
+        elif residual_type == 'kimi_attn_res':
+            from block_attn_res import KimiAttnResLayer
+            return nn.ModuleList([
+                KimiAttnResLayer(config, layer_idx=i)
+                for i in range(config.n_layer)
+            ])
+        elif residual_type == 'denseformer':
+            from block_attn_res import DenseFormerLayer
+            return nn.ModuleList([
+                DenseFormerLayer(config, layer_idx=i)
                 for i in range(config.n_layer)
             ])
         else:
@@ -736,19 +803,23 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
 
         # ── Layer computation: sequential or DEER-parallel ──
+        residual_type = getattr(self.config, 'residual_type', 'standard')
         if self._deer_engine is not None and not self.training:
-            # DEER mode — parallelise layers over depth (inference only)
             x = self._deer_engine(x)
-        elif getattr(self.config, 'residual_type', 'standard') == 'block_attn':
-            # Block Attention Residual: state-based peridynamics over depth
-            from block_attn_res import BlockAttnResLayer
-            blocks = [x]         # initial block = token embedding
-            partial = x          # partial sum starts from embedding
+        elif residual_type in ('block_attn', 'kimi_attn_res'):
+            # Block Attention Residual (ours or Kimi baseline)
+            blocks = [x]
+            partial = x
             for layer in self.transformer.h:
                 blocks, partial = layer(blocks, partial)
             x = partial
+        elif residual_type == 'denseformer':
+            # DenseFormer DWA baseline
+            all_outputs = [x]
+            for layer in self.transformer.h:
+                all_outputs = layer(all_outputs)
+            x = all_outputs[-1]
         else:
-            # Standard sequential forward
             for block in self.transformer.h:
                 x = block(x)
 

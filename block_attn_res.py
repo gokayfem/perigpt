@@ -260,6 +260,151 @@ def _make_norm(dim, config):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DenseFormer DWA (comparison baseline from Pagliardini et al., NeurIPS 2024)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DenseFormerLayer(nn.Module):
+    """
+    Transformer layer with DenseFormer Depth-Weighted-Average.
+
+    After each layer, the output is a learned weighted sum of ALL previous
+    layer outputs (including embedding). Weights are static scalars — NOT
+    input-dependent (unlike block_attn_res which uses attention).
+
+    This is the comparison baseline for block_attn_res: same idea (learned
+    skip connections across depth) but simpler (scalars vs attention).
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        D = config.n_embd
+        self.layer_idx = layer_idx
+
+        # Standard transformer sub-layers
+        self.attn_norm = _make_norm(D, config)
+        attn_type = getattr(config, 'attention_type', 'standard')
+        if attn_type == 'peridynamic':
+            from model import PeriDynamicAttention
+            self.attn = PeriDynamicAttention(config)
+        elif attn_type == 'state_peridynamic':
+            from model import StatePeriDynamicAttention
+            self.attn = StatePeriDynamicAttention(config)
+        elif attn_type == 'sliding_window':
+            from model import SlidingWindowAttention
+            self.attn = SlidingWindowAttention(config)
+        else:
+            from model import CausalSelfAttention
+            self.attn = CausalSelfAttention(config)
+
+        self.mlp_norm = _make_norm(D, config)
+        from model import MLP
+        self.mlp = MLP(config)
+
+        # DWA: layer_idx + 1 source representations (layers 0..layer_idx + embedding)
+        n_sources = layer_idx + 2  # +1 for embedding, +1 for current layer
+        self.dwa_weights = nn.Linear(n_sources, 1, bias=False)
+        # Init: identity (weight 1.0 on most recent, 0.0 on rest)
+        nn.init.zeros_(self.dwa_weights.weight)
+        self.dwa_weights.weight.data[0, -1] = 1.0
+
+    def forward(self, all_outputs: list) -> list:
+        """
+        Args:
+            all_outputs: list of [x_0, x_1, ..., x_{l-1}] — all previous layer outputs
+
+        Returns:
+            all_outputs: extended list with x_l appended
+        """
+        # DWA: weighted sum of all previous outputs
+        x_prev = all_outputs[-1]
+        x = x_prev + self.attn(self.attn_norm(x_prev))
+        x = x + self.mlp(self.mlp_norm(x))
+
+        # Apply DWA over all outputs including this one
+        all_plus_current = all_outputs + [x]
+        stacked = torch.stack(all_plus_current, dim=0)  # [N, B, T, D]
+        # Weights: unconstrained scalars, no softmax (per DenseFormer)
+        w = self.dwa_weights.weight.squeeze(0)  # [N]
+        x_dwa = torch.einsum('n, n b t d -> b t d', w, stacked)
+
+        return all_outputs + [x_dwa]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Kimi Attention Residuals (comparison baseline, arXiv:2603.15031)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class KimiAttnResLayer(nn.Module):
+    """
+    Kimi-style Attention Residuals (WITHOUT damage gating).
+
+    Same as our BlockAttnResLayer but without the peridynamic damage
+    mechanism. This isolates the contribution of damage gating.
+
+    Differences from our BlockAttnResLayer:
+    - No damage projections (damage_proj, damage_out)
+    - Pure softmax weighting over block summaries
+    - Otherwise identical block structure and pseudo-query mechanism
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        D = config.n_embd
+        self.layer_idx = layer_idx
+        self.depth_block_size = getattr(config, 'depth_block_size', 4)
+
+        self.attn_norm = _make_norm(D, config)
+        attn_type = getattr(config, 'attention_type', 'standard')
+        if attn_type == 'peridynamic':
+            from model import PeriDynamicAttention
+            self.attn = PeriDynamicAttention(config)
+        elif attn_type == 'state_peridynamic':
+            from model import StatePeriDynamicAttention
+            self.attn = StatePeriDynamicAttention(config)
+        elif attn_type == 'sliding_window':
+            from model import SlidingWindowAttention
+            self.attn = SlidingWindowAttention(config)
+        else:
+            from model import CausalSelfAttention
+            self.attn = CausalSelfAttention(config)
+
+        self.mlp_norm = _make_norm(D, config)
+        from model import MLP
+        self.mlp = MLP(config)
+
+        # Block attention projections (NO damage — pure Kimi AttnRes)
+        self.attn_res_proj = nn.Linear(D, 1, bias=False)
+        self.attn_res_norm = RMSNorm(D)
+        self.mlp_res_proj = nn.Linear(D, 1, bias=False)
+        self.mlp_res_norm = RMSNorm(D)
+
+        self.is_block_boundary = (
+            (layer_idx + 1) % self.depth_block_size == 0
+        )
+
+    def forward(self, blocks: list, partial_block: torch.Tensor) -> tuple:
+        # Block attn-res before attention (NO damage args)
+        h = block_attn_res(
+            blocks, partial_block,
+            self.attn_res_proj, self.attn_res_norm)
+
+        attn_out = self.attn(self.attn_norm(h))
+        partial_block = partial_block + attn_out
+
+        h = block_attn_res(
+            blocks, partial_block,
+            self.mlp_res_proj, self.mlp_res_norm)
+
+        mlp_out = self.mlp(self.mlp_norm(h))
+        partial_block = partial_block + mlp_out
+
+        if self.is_block_boundary:
+            blocks = blocks + [partial_block]
+
+        return blocks, partial_block
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Block-Aware Peridynamic Damage for DEER
 # ═══════════════════════════════════════════════════════════════════════════
 
