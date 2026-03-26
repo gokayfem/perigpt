@@ -643,12 +643,9 @@ class Block(nn.Module):
         attn_type = getattr(config, 'attention_type', 'standard')
         if attn_type == 'peridynamic':
             self.attn = PeriDynamicAttention(config)
-        elif attn_type == 'peridynamic_triton':
-            from peri_triton import PeriDynamicAttentionTriton
-            self.attn = PeriDynamicAttentionTriton(config)
-        elif attn_type == 'peridynamic_blackwell':
-            from peri_triton_blackwell import PeriDynamicAttentionBlackwell
-            self.attn = PeriDynamicAttentionBlackwell(config)
+        elif attn_type == 'peridynamic_flex':
+            from peri_flex import PeriDynamicAttentionFlex
+            self.attn = PeriDynamicAttentionFlex(config)
         elif attn_type == 'state_peridynamic':
             self.attn = StatePeriDynamicAttention(config)
         elif attn_type == 'hybrid':
