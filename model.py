@@ -646,6 +646,9 @@ class Block(nn.Module):
         elif attn_type == 'peridynamic_triton':
             from peri_triton import PeriDynamicAttentionTriton
             self.attn = PeriDynamicAttentionTriton(config)
+        elif attn_type == 'peridynamic_blackwell':
+            from peri_triton_blackwell import PeriDynamicAttentionBlackwell
+            self.attn = PeriDynamicAttentionBlackwell(config)
         elif attn_type == 'state_peridynamic':
             self.attn = StatePeriDynamicAttention(config)
         elif attn_type == 'hybrid':
