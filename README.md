@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/header.jpg" alt="PeriGPT" width="100%">
+</p>
+
 # PeriGPT: Peridynamic Attention for Heterogeneous Sequence Modeling
 
 **Attention mechanisms derived from nonlocal continuum mechanics that discover structural boundaries through damage mechanics.**
