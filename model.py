@@ -331,15 +331,15 @@ class PeriDynamicAttention(nn.Module):
         # output[t] = Σ_j weight[t,j] * val[t - δ + 1 + j]
         val_padded = F.pad(val, (0, 0, delta - 1, 0))   # (B, nh, T+δ-1, hs)
 
-        if x.is_cuda:
-            # GPU: strided view + single matmul (zero copy, one kernel launch)
+        if x.is_cuda or (hasattr(torch.backends, 'mps') and x.device.type == 'mps'):
+            # GPU (CUDA/MPS): strided view + single matmul (zero copy, one kernel)
             BN = B * nh
             val_flat = val_padded.reshape(BN, T + delta - 1, hs).contiguous()
             val_win = self._strided_window(val_flat, delta)  # (BN, T, δ, hs) — VIEW
             w_flat = weights.reshape(BN, T, 1, delta)
             output = torch.matmul(w_flat, val_win).squeeze(2).reshape(B, nh, T, hs)
         else:
-            # CPU/MPS: shift-accumulate loop (better cache behavior)
+            # CPU: shift-accumulate loop (better cache behavior)
             output = torch.zeros(B, nh, T, hs, device=x.device, dtype=val.dtype)
             for j in range(delta):
                 w_j = weights[:, :, :, j].unsqueeze(-1)
