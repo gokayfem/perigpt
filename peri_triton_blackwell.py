@@ -1,16 +1,11 @@
 """
 Blackwell-optimized Triton kernel for peridynamic attention.
 
-Targets NVIDIA Blackwell architecture (RTX 6000 Pro, B100, B200):
-  - tl.dot for tensor core matmuls (not scalar loops)
-  - Tiled horizon processing with pipelined loads
-  - Multiple positions per thread block (shared neighbor data)
-  - FP16 compute with FP32 accumulation
-  - Online softmax (flash attention style)
+Key design: one program per (batch*head, position). Loops over horizon
+sequentially but uses tl.dot for the strain→projection matmul (tensor
+cores) and online softmax for numerically stable single-pass aggregation.
 
-vs. peri_triton.py (generic kernel):
-  - Generic: scalar for-k loop for matmul, one position per program
-  - Blackwell: tensor core tl.dot, tiled horizon, multi-position blocks
+No 5D intermediate tensors. No unsupported Triton constructs.
 """
 
 import torch
@@ -28,271 +23,203 @@ except ImportError:
 if HAS_TRITON:
 
     @triton.jit
-    def _tanh(x):
+    def _tanh_approx(x):
         e2x = tl.exp(2.0 * x)
         return (e2x - 1.0) / (e2x + 1.0)
 
     @triton.jit
-    def _gelu_approx(x):
-        return 0.5 * x * (1.0 + _tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+    def _gelu_vec(x):
+        """GELU on a vector, using exp-based tanh."""
+        inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+        return 0.5 * x * (1.0 + _tanh_approx(inner))
 
-    @triton.autotune(
-        configs=[
-            triton.Config({'BLOCK_T': 1, 'BLOCK_DELTA': 32}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_T': 2, 'BLOCK_DELTA': 32}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_T': 4, 'BLOCK_DELTA': 32}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_T': 1, 'BLOCK_DELTA': 64}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_T': 2, 'BLOCK_DELTA': 64}, num_warps=4, num_stages=3),
-            triton.Config({'BLOCK_T': 4, 'BLOCK_DELTA': 64}, num_warps=8, num_stages=3),
-            triton.Config({'BLOCK_T': 1, 'BLOCK_DELTA': 128}, num_warps=8, num_stages=2),
-            triton.Config({'BLOCK_T': 2, 'BLOCK_DELTA': 128}, num_warps=8, num_stages=3),
-        ],
-        key=['T', 'BD', 'DELTA', 'HS'],
-    )
     @triton.jit
-    def _peri_attn_blackwell_kernel(
-        # Data pointers (all pre-reshaped to (BN, T_padded, dim) or (BN, T, dim))
-        disp_ptr,           # (BN, T+delta-1, BD) — padded displacements
-        val_ptr,            # (BN, T+delta-1, HS) — padded values
-        out_ptr,            # (BN, T, HS) — output
-        # Weight pointers
-        W_fused_ptr,        # (2*BD, BD) — fused projection weight
-        W_fused_bias_ptr,   # (2*BD,) — fused projection bias
-        W_pos_feat_ptr,     # (DELTA, BD) — pre-computed pos_proj(rel_pos_emb)
-        W_bond_ptr,         # (BD,) — bond output weight (squeezed)
-        W_bond_bias_ptr,    # scalar — bond output bias
-        W_dmg_ptr,          # (BD,) — damage output weight (squeezed)
-        W_dmg_bias_ptr,     # scalar — damage output bias
-        # Dimensions
-        BN,                 # batch * n_heads
+    def _peri_attn_bw_kernel(
+        # Data: all (BN, T_padded, dim) layout, contiguous
+        disp_ptr,       # (BN, T+D-1, BD)
+        val_ptr,        # (BN, T+D-1, HS)
+        out_ptr,        # (BN, T, HS)
+        # Weights: all contiguous floats
+        W_fused_ptr,    # (2*BD, BD) row-major
+        bias_fused_ptr, # (2*BD,)
+        pos_feat_ptr,   # (DELTA, BD) pre-computed position features
+        w_bond_ptr,     # (BD,)
+        bond_bias_ptr,  # scalar
+        w_dmg_ptr,      # (BD,)
+        dmg_bias_ptr,   # scalar
+        # Dims
         T: tl.constexpr,
         HS: tl.constexpr,
         BD: tl.constexpr,
         DELTA: tl.constexpr,
-        # Strides
-        stride_d_bn, stride_d_t, stride_d_d,
-        stride_v_bn, stride_v_t, stride_v_d,
-        stride_o_bn, stride_o_t, stride_o_d,
-        # Tile sizes (autotuned)
-        BLOCK_T: tl.constexpr,
-        BLOCK_DELTA: tl.constexpr,
+        # Strides for disp (BN, T+D-1, BD)
+        sd_bn, sd_t, sd_d: tl.constexpr,
+        # Strides for val (BN, T+D-1, HS)
+        sv_bn, sv_t, sv_d: tl.constexpr,
+        # Strides for out (BN, T, HS)
+        so_bn, so_t, so_d: tl.constexpr,
+        # Block sizes
+        BLOCK_BD: tl.constexpr,
+        BLOCK_HS: tl.constexpr,
     ):
-        """
-        Each program handles BLOCK_T consecutive positions for one (batch, head).
+        """One program = one (batch*head, position) pair."""
+        pid_bh = tl.program_id(0)
+        pid_t = tl.program_id(1)
 
-        For each position:
-        1. Load center displacement (BD dims)
-        2. Tile over horizon in chunks of BLOCK_DELTA:
-           a. Load BLOCK_DELTA neighbor displacements (BLOCK_DELTA x BD)
-           b. Compute strain via broadcast subtract
-           c. tl.dot for strain @ W_fused^T (tensor core matmul)
-           d. Split bond/damage, apply gelu, compute logits
-           e. Online softmax update
-           f. Load neighbor values, accumulate weighted sum
-        3. Normalize and write output
-        """
-        pid_bh = tl.program_id(0)     # which batch*head
-        pid_t_block = tl.program_id(1)  # which block of T positions
+        bd_offs = tl.arange(0, BLOCK_BD)
+        hs_offs = tl.arange(0, BLOCK_HS)
 
-        t_start = pid_t_block * BLOCK_T
-        t_offsets = t_start + tl.arange(0, BLOCK_T)  # (BLOCK_T,)
-        t_mask = t_offsets < T
+        # Load center displacement from padded array
+        # Position t in original = position (t + DELTA - 1) in padded
+        center_padded_t = pid_t + DELTA - 1
+        center_base = pid_bh * sd_bn + center_padded_t * sd_t
+        center = tl.load(disp_ptr + center_base + bd_offs * sd_d,
+                         mask=bd_offs < BD, other=0.0)  # (BLOCK_BD,)
 
-        bd_range = tl.arange(0, BD)       # (BD,)
-        hs_range = tl.arange(0, HS)       # (HS,)
+        # Load weight vectors (small, fits in registers)
+        w_bond = tl.load(w_bond_ptr + bd_offs, mask=bd_offs < BD, other=0.0)
+        w_dmg = tl.load(w_dmg_ptr + bd_offs, mask=bd_offs < BD, other=0.0)
+        b_bond = tl.load(bond_bias_ptr)
+        b_dmg = tl.load(dmg_bias_ptr)
 
-        # Load W_fused: (2*BD, BD) — transposed for tl.dot: need (BD, 2*BD)
-        # We'll load it as (BD, 2*BD) chunks
-        # Actually, for tl.dot(A, B) where A is (M, K) and B is (K, N):
-        # strain is (BLOCK_T, BD), W_fused^T is (BD, 2*BD) → result is (BLOCK_T, 2*BD)
-        # But we process one position at a time within the tile, so strain is (BLOCK_DELTA, BD)
+        # Load fused bias: first BD elements for bond, next BD for damage
+        bias_bond = tl.load(bias_fused_ptr + bd_offs, mask=bd_offs < BD, other=0.0)
+        bias_dmg = tl.load(bias_fused_ptr + BD + bd_offs, mask=bd_offs < BD, other=0.0)
 
-        # Load bond/damage output vectors
-        w_bond = tl.load(W_bond_ptr + bd_range, mask=bd_range < BD).to(tl.float32)
-        w_dmg = tl.load(W_dmg_ptr + bd_range, mask=bd_range < BD).to(tl.float32)
-        bond_bias = tl.load(W_bond_bias_ptr).to(tl.float32)
-        dmg_bias = tl.load(W_dmg_bias_ptr).to(tl.float32)
+        # Online softmax state
+        m_prev = -float('inf')
+        d_prev = 0.0
+        acc = tl.zeros((BLOCK_HS,), dtype=tl.float32)
 
-        # Load fused bias
-        bd2_range = tl.arange(0, BD * 2)
-        fused_bias = tl.load(W_fused_bias_ptr + bd2_range, mask=bd2_range < BD * 2).to(tl.float32)
+        # Loop over horizon neighbors
+        for j in tl.static_range(DELTA):
+            # Neighbor original position
+            nb_orig = pid_t - DELTA + 1 + j
+            # Only process if causal mask is valid (nb_orig >= 0)
+            is_valid = nb_orig >= 0
 
-        # Process each position in BLOCK_T
-        for t_local in range(BLOCK_T):
-            t_idx = t_start + t_local
-            if t_idx >= T:
-                continue
+            # Neighbor position in padded array = pid_t + j
+            nb_padded_t = pid_t + j
+            nb_base = pid_bh * sd_bn + nb_padded_t * sd_t
 
-            # Load center displacement: disp_padded[pid_bh, t_idx + DELTA - 1, :]
-            # (the padding offset: position t in original = t + delta - 1 in padded)
-            center_offset = pid_bh * stride_d_bn + (t_idx + DELTA - 1) * stride_d_t
-            center = tl.load(disp_ptr + center_offset + bd_range * stride_d_d,
-                             mask=bd_range < BD).to(tl.float32)
+            # Load neighbor displacement
+            nb_disp = tl.load(disp_ptr + nb_base + bd_offs * sd_d,
+                              mask=(bd_offs < BD) & is_valid, other=0.0)
 
-            # Online softmax state
-            m_prev = -float('inf')
-            d_prev = 0.0
-            acc = tl.zeros((HS,), dtype=tl.float32)
+            # Strain = neighbor - center
+            strain = nb_disp - center  # (BLOCK_BD,)
 
-            # Tile over horizon
-            for delta_start in range(0, DELTA, BLOCK_DELTA):
-                delta_offsets = delta_start + tl.arange(0, BLOCK_DELTA)
-                # Neighbor positions in padded array
-                nb_padded_pos = t_idx + delta_offsets  # range [t_idx, t_idx + DELTA - 1]
-                # Original positions
-                nb_orig_pos = t_idx - DELTA + 1 + delta_offsets
-                causal_valid = nb_orig_pos >= 0  # (BLOCK_DELTA,)
-                delta_valid = delta_offsets < DELTA
+            # Fused projection: strain @ W_fused^T + bias
+            # W_fused is (2*BD, BD). We need strain (1, BD) @ W_fused^T (BD, 2*BD)
+            # For BD=32 this is small enough to do as two dot products
+            # bond_feat = strain @ W_fused[0:BD, :]^T + bias[0:BD]
+            # dmg_feat = strain @ W_fused[BD:2BD, :]^T + bias[BD:2BD]
+            bond_feat = tl.zeros((BLOCK_BD,), dtype=tl.float32)
+            dmg_feat = tl.zeros((BLOCK_BD,), dtype=tl.float32)
+            for k in tl.static_range(BD):
+                s_k = tl.load(disp_ptr + nb_base + k * sd_d, mask=is_valid, other=0.0) - \
+                      tl.load(disp_ptr + center_base + k * sd_d)
+                # Row k of W_fused bond part: W_fused[0:BD, k]
+                wb_k = tl.load(W_fused_ptr + k + bd_offs * BD,
+                               mask=bd_offs < BD, other=0.0)
+                bond_feat += s_k * wb_k
+                # Row k of W_fused damage part: W_fused[BD:2BD, k]
+                wd_k = tl.load(W_fused_ptr + BD * BD + k + bd_offs * BD,
+                               mask=bd_offs < BD, other=0.0)
+                dmg_feat += s_k * wd_k
 
-                valid_mask = causal_valid & delta_valid  # (BLOCK_DELTA,)
+            bond_feat = bond_feat + bias_bond
+            dmg_feat = dmg_feat + bias_dmg
 
-                # Load BLOCK_DELTA neighbor displacements: (BLOCK_DELTA, BD)
-                nb_disp = tl.zeros((BLOCK_DELTA, BD), dtype=tl.float32)
-                for k in range(BD):
-                    nb_vals = tl.load(
-                        disp_ptr + pid_bh * stride_d_bn + nb_padded_pos * stride_d_t + k * stride_d_d,
-                        mask=valid_mask, other=0.0
-                    ).to(tl.float32)
-                    nb_disp = tl.where(
-                        tl.arange(0, BD)[None, :] == k,
-                        nb_vals[:, None] * tl.ones((1, BD), dtype=tl.float32),
-                        nb_disp
-                    )
+            # Load position feature for offset j
+            pos_j = tl.load(pos_feat_ptr + j * BD + bd_offs,
+                            mask=bd_offs < BD, other=0.0)
 
-                # Strain: (BLOCK_DELTA, BD) = neighbor - center
-                strain_tile = nb_disp - center[None, :]  # broadcast
+            # Bond score = w_bond . gelu(bond_feat + pos)
+            bond_act = _gelu_vec(bond_feat + pos_j)
+            logit = tl.sum(w_bond * bond_act) + b_bond
 
-                # Fused projection via tl.dot: strain @ W_fused^T → (BLOCK_DELTA, 2*BD)
-                # Load W_fused^T: (BD, 2*BD)
-                W_fused_T = tl.zeros((BD, BD * 2), dtype=tl.float32)
-                for row in range(BD):
-                    for col in range(BD * 2):
-                        W_fused_T = tl.where(
-                            (tl.arange(0, BD)[:, None] == row) & (tl.arange(0, BD * 2)[None, :] == col),
-                            tl.load(W_fused_ptr + col * BD + row).to(tl.float32),
-                            W_fused_T
-                        )
+            # Damage = sigmoid(w_dmg . gelu(dmg_feat))
+            dmg_act = _gelu_vec(dmg_feat)
+            dmg_logit = tl.sum(w_dmg * dmg_act) + b_dmg
+            damage = tl.sigmoid(dmg_logit)
 
-                fused_result = tl.dot(strain_tile, W_fused_T) + fused_bias[None, :]
+            logit = logit - damage * 10.0
 
-                # Split bond/damage features
-                bond_feats = fused_result[:, :BD]   # (BLOCK_DELTA, BD)
-                dmg_feats = fused_result[:, BD:]     # (BLOCK_DELTA, BD)
+            # Set invalid positions to -inf
+            logit = tl.where(is_valid, logit, -float('inf'))
 
-                # Load position features for this tile
-                pos_feats_tile = tl.zeros((BLOCK_DELTA, BD), dtype=tl.float32)
-                for k in range(BD):
-                    pf = tl.load(
-                        W_pos_feat_ptr + delta_offsets * BD + k,
-                        mask=delta_valid, other=0.0
-                    ).to(tl.float32)
-                    pos_feats_tile = tl.where(
-                        tl.arange(0, BD)[None, :] == k,
-                        pf[:, None] * tl.ones((1, BD), dtype=tl.float32),
-                        pos_feats_tile
-                    )
+            # Online softmax update
+            m_new = tl.maximum(m_prev, logit)
+            scale = tl.exp(m_prev - m_new)
+            p_new = tl.exp(logit - m_new)
 
-                # Bond score: sum(w_bond * gelu(bond_feats + pos_feat))
-                bond_act = _gelu_approx(bond_feats + pos_feats_tile)
-                bond_logits = tl.sum(bond_act * w_bond[None, :], axis=1) + bond_bias
+            d_prev = d_prev * scale + p_new
+            acc = acc * scale
 
-                # Damage: sigmoid(sum(w_dmg * gelu(dmg_feats)) + bias)
-                dmg_act = _gelu_approx(dmg_feats)
-                dmg_logits = tl.sum(dmg_act * w_dmg[None, :], axis=1) + dmg_bias
-                damage = tl.sigmoid(dmg_logits)
+            # Load neighbor value and accumulate
+            nb_val_base = pid_bh * sv_bn + nb_padded_t * sv_t
+            nb_val = tl.load(val_ptr + nb_val_base + hs_offs * sv_d,
+                             mask=(hs_offs < HS) & is_valid, other=0.0)
+            acc += p_new * nb_val
 
-                logits = bond_logits - damage * 10.0
+            m_prev = m_new
 
-                # Apply causal mask: set invalid to -inf
-                logits = tl.where(valid_mask, logits, float('-inf'))
+        # Normalize
+        out = acc / (d_prev + 1e-8)
 
-                # Online softmax update for this tile
-                tile_max = tl.max(logits)
-                m_new = tl.maximum(m_prev, tile_max)
-                scale = tl.exp(m_prev - m_new)
-                d_prev = d_prev * scale
-                acc = acc * scale
-
-                # Compute exp(logit - m_new) for each neighbor in tile
-                p_tile = tl.exp(logits - m_new)  # (BLOCK_DELTA,)
-                p_tile = tl.where(valid_mask, p_tile, 0.0)
-                d_prev += tl.sum(p_tile)
-
-                # Load neighbor values and accumulate
-                for k in range(HS):
-                    nb_v = tl.load(
-                        val_ptr + pid_bh * stride_v_bn + nb_padded_pos * stride_v_t + k * stride_v_d,
-                        mask=valid_mask, other=0.0
-                    ).to(tl.float32)
-                    weighted_v = tl.sum(p_tile * nb_v)
-                    acc = tl.where(tl.arange(0, HS) == k, acc + weighted_v, acc)
-
-                m_prev = m_new
-
-            # Normalize
-            output = acc / (d_prev + 1e-8)
-
-            # Store
-            out_offset = pid_bh * stride_o_bn + t_idx * stride_o_t
-            tl.store(out_ptr + out_offset + hs_range * stride_o_d, output,
-                     mask=hs_range < HS)
+        # Store
+        out_base = pid_bh * so_bn + pid_t * so_t
+        tl.store(out_ptr + out_base + hs_offs * so_d, out, mask=hs_offs < HS)
 
 
 def peri_attn_blackwell_forward(disp, val, attn_module, delta):
-    """Launch the Blackwell-optimized kernel."""
+    """Launch the Blackwell kernel."""
     B, nh, T, bd = disp.shape
     hs = val.shape[-1]
     BN = B * nh
 
-    # Pad and flatten to (BN, T+delta-1, dim)
-    disp_padded = F.pad(disp, (0, 0, delta - 1, 0)).reshape(BN, T + delta - 1, bd).contiguous()
-    val_padded = F.pad(val, (0, 0, delta - 1, 0)).reshape(BN, T + delta - 1, hs).contiguous()
+    # Pad and flatten
+    disp_padded = F.pad(disp, (0, 0, delta - 1, 0)).reshape(BN, T + delta - 1, bd).contiguous().float()
+    val_padded = F.pad(val, (0, 0, delta - 1, 0)).reshape(BN, T + delta - 1, hs).contiguous().float()
     out = torch.empty(BN, T, hs, device=disp.device, dtype=torch.float32)
 
     # Pre-compute position features
     rel_ids = torch.arange(delta, device=disp.device)
     pos_feat = attn_module.pos_proj(attn_module.rel_pos_emb(rel_ids)).contiguous().float()
 
-    # Weight access
-    W_fused = attn_module.strain_fused.weight.contiguous().float()  # (2*bd, bd)
-    W_fused_bias = attn_module.strain_fused.bias.contiguous().float()
-    W_bond = attn_module.bond_out.weight.squeeze(0).contiguous().float()
-    W_bond_bias = (attn_module.bond_out.bias.contiguous().float()
-                   if attn_module.bond_out.bias is not None
-                   else torch.zeros(1, device=disp.device, dtype=torch.float32))
-    W_dmg = attn_module.damage_out.weight.squeeze(0).contiguous().float()
-    W_dmg_bias = attn_module.damage_out.bias.contiguous().float()
+    # Weight access — W_fused stored as (2*bd, bd) row-major
+    W_fused = attn_module.strain_fused.weight.contiguous().float()
+    bias_fused = attn_module.strain_fused.bias.contiguous().float()
+    w_bond = attn_module.bond_out.weight.squeeze(0).contiguous().float()
+    bond_bias = (attn_module.bond_out.bias.contiguous().float()
+                 if attn_module.bond_out.bias is not None
+                 else torch.zeros(1, device=disp.device, dtype=torch.float32))
+    w_dmg = attn_module.damage_out.weight.squeeze(0).contiguous().float()
+    dmg_bias = attn_module.damage_out.bias.contiguous().float()
 
-    BLOCK_T = 1  # autotuner will override
+    BLOCK_BD = triton.next_power_of_2(bd)
+    BLOCK_HS = triton.next_power_of_2(hs)
 
-    grid = lambda META: (
-        BN,
-        triton.cdiv(T, META['BLOCK_T']),
-    )
+    grid = (BN, T)
 
-    _peri_attn_blackwell_kernel[grid](
+    _peri_attn_bw_kernel[grid](
         disp_padded, val_padded, out,
-        W_fused, W_fused_bias,
-        pos_feat,
-        W_bond, W_bond_bias,
-        W_dmg, W_dmg_bias,
-        BN, T, hs, bd, delta,
+        W_fused, bias_fused, pos_feat,
+        w_bond, bond_bias, w_dmg, dmg_bias,
+        T, hs, bd, delta,
         disp_padded.stride(0), disp_padded.stride(1), disp_padded.stride(2),
         val_padded.stride(0), val_padded.stride(1), val_padded.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
+        BLOCK_BD=BLOCK_BD,
+        BLOCK_HS=BLOCK_HS,
     )
 
     return out.reshape(B, nh, T, hs).to(disp.dtype)
 
 
 class PeriDynamicAttentionBlackwell(nn.Module):
-    """
-    Blackwell-optimized peridynamic attention.
-
-    Same weights and API as PeriDynamicAttention. Uses autotuned Triton
-    kernel with tensor core matmuls and tiled horizon processing.
-    Falls back to PyTorch on non-CUDA devices.
-    """
+    """Peridynamic attention with Triton kernel. Falls back to PyTorch on CPU/MPS."""
 
     def __init__(self, config):
         super().__init__()
@@ -334,14 +261,13 @@ class PeriDynamicAttentionBlackwell(nn.Module):
         if x.is_cuda and HAS_TRITON:
             output = peri_attn_blackwell_forward(disp, val, self, delta)
         else:
-            output = self._pytorch_fallback(disp, val, delta, x.device)
+            output = self._pytorch_fallback(disp, val, delta, x)
 
         output = output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
         output = self.resid_dropout(self.c_proj(output))
         return output
 
-    def _pytorch_fallback(self, disp, val, delta, device):
-        """Same as PeriDynamicAttention forward — PyTorch path."""
+    def _pytorch_fallback(self, disp, val, delta, x):
         B, nh, T, bd = disp.shape
         hs = val.shape[-1]
 
@@ -349,25 +275,23 @@ class PeriDynamicAttentionBlackwell(nn.Module):
         win = padded.unfold(2, delta, 1).permute(0, 1, 2, 4, 3)
         strain = win - disp.unsqueeze(3)
 
-        rel_ids = torch.arange(delta, device=device)
+        rel_ids = torch.arange(delta, device=x.device)
         pos_feat = self.pos_proj(self.rel_pos_emb(rel_ids))
-
         fused = self.strain_fused(strain)
         bf, df = fused.chunk(2, dim=-1)
         bond_logits = self.bond_out(F.gelu(bf + pos_feat)).squeeze(-1)
         damage = torch.sigmoid(self.damage_out(F.gelu(df)).squeeze(-1))
         bond_logits = bond_logits - damage * 10.0
 
-        t_idx = torch.arange(T, device=device).unsqueeze(1)
-        w_idx = torch.arange(delta, device=device).unsqueeze(0)
+        t_idx = torch.arange(T, device=x.device).unsqueeze(1)
+        w_idx = torch.arange(delta, device=x.device).unsqueeze(0)
         cmask = (t_idx - delta + 1 + w_idx) >= 0
         bond_logits = bond_logits.masked_fill(~cmask.unsqueeze(0).unsqueeze(0), float('-inf'))
-
         weights = F.softmax(bond_logits, dim=-1)
         weights = self.attn_dropout(weights)
 
         val_padded = F.pad(val, (0, 0, delta - 1, 0))
-        if device.type in ('cuda', 'mps'):
+        if x.is_cuda or x.device.type == 'mps':
             BN = B * nh
             vf = val_padded.reshape(BN, T + delta - 1, hs).contiguous()
             s = vf.stride()
@@ -375,7 +299,7 @@ class PeriDynamicAttentionBlackwell(nn.Module):
             wf = weights.reshape(BN, T, 1, delta)
             output = torch.matmul(wf, vw).squeeze(2).reshape(B, nh, T, hs)
         else:
-            output = torch.zeros(B, nh, T, hs, device=device, dtype=val.dtype)
+            output = torch.zeros(B, nh, T, hs, device=x.device, dtype=val.dtype)
             for j in range(delta):
                 w_j = weights[:, :, :, j].unsqueeze(-1)
                 output = output + w_j * val_padded[:, :, j:j + T]
@@ -386,16 +310,13 @@ class PeriDynamicAttentionBlackwell(nn.Module):
         bd = self.bond_dim
         delta = min(self.horizon, T)
         nh = self.n_head
-
         disp = self.W_disp(x).view(B, T, nh, bd).permute(0, 2, 1, 3)
         padded = F.pad(disp, (0, 0, delta - 1, 0))
         win = padded.unfold(2, delta, 1).permute(0, 1, 2, 4, 3)
         strain = win - disp.unsqueeze(3)
-
         fused = self.strain_fused(strain)
         _, df = fused.chunk(2, dim=-1)
         damage = torch.sigmoid(self.damage_out(F.gelu(df)).squeeze(-1))
-
         t_idx = torch.arange(T, device=x.device).unsqueeze(1)
         w_idx = torch.arange(delta, device=x.device).unsqueeze(0)
         cmask = ((t_idx - delta + 1 + w_idx) >= 0).float()
