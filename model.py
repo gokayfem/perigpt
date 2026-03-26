@@ -248,26 +248,6 @@ class PeriDynamicAttention(nn.Module):
         self.attn_dropout  = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # Pre-allocate causal mask and position features (cached, not recomputed)
-        self._cached_cmask = {}
-        self._cached_pos_feat = {}
-
-    # ---- helpers -----------------------------------------------------------
-
-    def _get_cmask(self, T, delta, device):
-        """Cached causal mask — computed once per (T, delta) pair."""
-        key = (T, delta, device)
-        if key not in self._cached_cmask:
-            t_idx = torch.arange(T, device=device).unsqueeze(1)
-            w_idx = torch.arange(delta, device=device).unsqueeze(0)
-            self._cached_cmask[key] = (t_idx - delta + 1 + w_idx) >= 0
-        return self._cached_cmask[key]
-
-    def _get_pos_feat(self, delta, device):
-        """Position features — recomputed each forward (weights may change during training)."""
-        rel_ids = torch.arange(delta, device=device)
-        return self.pos_proj(self.rel_pos_emb(rel_ids))
-
     @staticmethod
     def _strided_window(tensor, delta):
         """Create a causal sliding window view via as_strided — ZERO memory copy.
@@ -318,13 +298,16 @@ class PeriDynamicAttention(nn.Module):
         # ---- build displacement windows only (NOT value windows) -----------
         disp_win = self._build_windows(disp, delta)   # (B, nh, T, δ, bd)
 
-        cmask = self._get_cmask(T, delta, x.device)   # cached (T, δ)
+        t_idx = torch.arange(T, device=x.device).unsqueeze(1)
+        w_idx = torch.arange(delta, device=x.device).unsqueeze(0)
+        cmask = (t_idx - delta + 1 + w_idx) >= 0      # (T, δ)
 
         # ---- strain  (relative deformation) --------------------------------
         strain = disp_win - disp.unsqueeze(3)          # (B, nh, T, δ, bd)
 
         # ---- fused bond + damage projection --------------------------------
-        pos_feat = self._get_pos_feat(delta, x.device) # cached (δ, bd)
+        rel_ids = torch.arange(delta, device=x.device)
+        pos_feat = self.pos_proj(self.rel_pos_emb(rel_ids))  # (δ, bd)
 
         fused = self.strain_fused(strain)              # (B, nh, T, δ, 2*bd)
         bond_feats, damage_feats = fused.chunk(2, dim=-1)  # each (B, nh, T, δ, bd)
