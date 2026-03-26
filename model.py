@@ -250,23 +250,36 @@ class PeriDynamicAttention(nn.Module):
 
     # ---- helpers -----------------------------------------------------------
 
-    def _build_windows(self, tensor, delta):
-        """Left-pad `tensor` by δ−1 on the time axis, then unfold to get
-        causal sliding windows of width δ.
+    @staticmethod
+    def _strided_window(tensor, delta):
+        """Create a causal sliding window view via as_strided — ZERO memory copy.
 
-        Input:  (B, nh, T, D)
-        Output: (B, nh, T, δ, D)   — a *view* (no copy) when possible.
+        Input:  (BN, T, D) — contiguous, already padded by δ−1 on the left.
+        Output: (BN, T, δ, D) — overlapping windows, shared memory.
+
+        The key: consecutive windows overlap by δ−1 positions, so as_strided
+        makes them share memory. stride along the window dim (δ) equals stride
+        along the time dim (T), creating overlapping views.
         """
-        padded = F.pad(tensor, (0, 0, delta - 1, 0))          # (B, nh, T+δ−1, D)
-        win = padded.unfold(2, delta, 1)                       # (B, nh, T, D, δ)
-        return win.permute(0, 1, 2, 4, 3)                     # (B, nh, T, δ, D)
+        BN, T_padded, D = tensor.shape
+        T = T_padded - delta + 1
+        # strides: (BN_stride, T_stride_=D, window_stride_=D, feat_stride_=1)
+        s = tensor.stride()
+        return tensor.as_strided(
+            (BN, T, delta, D),
+            (s[0], s[1], s[1], s[2]),
+        )
+
+    def _build_windows(self, tensor, delta):
+        """Left-pad then strided window. Input: (B, nh, T, D). Output: (B, nh, T, δ, D)."""
+        B, nh, T, D = tensor.shape
+        padded = F.pad(tensor, (0, 0, delta - 1, 0))             # (B, nh, T+δ−1, D)
+        padded_flat = padded.reshape(B * nh, T + delta - 1, D).contiguous()
+        win = self._strided_window(padded_flat, delta)            # (B*nh, T, δ, D)
+        return win.reshape(B, nh, T, delta, D)
 
     def _causal_mask(self, T, delta, device):
-        """Boolean mask: True where the neighbour position is non-negative.
-
-        For token at position t, the window covers original positions
-        [t−δ+1, …, t].  Positions < 0 are zero-padded and must be masked.
-        """
+        """Boolean mask: True where the neighbour position is non-negative."""
         t_idx = torch.arange(T, device=device).unsqueeze(1)       # (T, 1)
         w_idx = torch.arange(delta, device=device).unsqueeze(0)   # (1, δ)
         return (t_idx - delta + 1 + w_idx) >= 0                   # (T, δ)
@@ -314,16 +327,23 @@ class PeriDynamicAttention(nn.Module):
         weights = F.softmax(bond_logits, dim=-1)        # (B, nh, T, δ)
         weights = self.attn_dropout(weights)
 
-        # ---- shift-accumulate value aggregation ----------------------------
-        # Instead of building val_win (B, nh, T, δ, hs) — which is the
-        # largest tensor — compute the weighted sum via shifted pointwise ops.
+        # ---- value aggregation ------------------------------------------------
         # output[t] = Σ_j weight[t,j] * val[t - δ + 1 + j]
-        # Memory: O(B*nh*T*hs) instead of O(B*nh*T*δ*hs) — δx reduction.
-        output = torch.zeros(B, nh, T, hs, device=x.device, dtype=val.dtype)
-        val_padded = F.pad(val, (0, 0, delta - 1, 0))  # (B, nh, T+δ-1, hs)
-        for j in range(delta):
-            w_j = weights[:, :, :, j].unsqueeze(-1)     # (B, nh, T, 1)
-            output = output + w_j * val_padded[:, :, j:j + T]  # (B, nh, T, hs)
+        val_padded = F.pad(val, (0, 0, delta - 1, 0))   # (B, nh, T+δ-1, hs)
+
+        if x.is_cuda:
+            # GPU: strided view + single matmul (zero copy, one kernel launch)
+            BN = B * nh
+            val_flat = val_padded.reshape(BN, T + delta - 1, hs).contiguous()
+            val_win = self._strided_window(val_flat, delta)  # (BN, T, δ, hs) — VIEW
+            w_flat = weights.reshape(BN, T, 1, delta)
+            output = torch.matmul(w_flat, val_win).squeeze(2).reshape(B, nh, T, hs)
+        else:
+            # CPU/MPS: shift-accumulate loop (better cache behavior)
+            output = torch.zeros(B, nh, T, hs, device=x.device, dtype=val.dtype)
+            for j in range(delta):
+                w_j = weights[:, :, :, j].unsqueeze(-1)
+                output = output + w_j * val_padded[:, :, j:j + T]
 
         # ---- reshape and project -------------------------------------------
         output = output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
