@@ -168,20 +168,45 @@ score = f(strain_ij, state_i, state_j, pos)     # interaction depends on both co
 
 ---
 
+## Performance
+
+Benchmarked on NVIDIA RTX 6000 Pro (Blackwell), B=64, T=256, 6 layers, h=128:
+
+| Method | ms/step | vs flash attention |
+|---|---|---|
+| Standard (flash attention) | 9.9 | 1.0x |
+| Standard + torch.compile | 9.4 | 0.95x |
+| Sliding window h=128 | 13.9 | 1.4x |
+| **Peridynamic + torch.compile** | **50.1** | **5.0x** |
+| Peridynamic (no compile) | 116.2 | 11.7x |
+
+`torch.compile` gives a **2.3x speedup** on peridynamic attention by fusing elementwise operations (strain subtraction, GELU, damage sigmoid, masking) while keeping cuBLAS for the matrix multiplies.
+
+The 5x overhead vs flash attention is the irreducible cost of strain-based scoring + damage mechanics — more math per token-pair than a dot product. The extra computation buys the damage-at-boundaries capability that standard attention lacks.
+
+**Optimizations applied:**
+- Fused strain + damage projections (one matmul instead of two on 5D tensors)
+- Strided-view value aggregation on GPU (zero-copy windowed matmul, no 5D val_win tensor)
+- Shift-accumulate fallback on CPU (128 contiguous-slice ops vs one non-contiguous einsum)
+- `torch.compile(mode='max-autotune')` for elementwise op fusion
+
+---
+
 ## Repository Structure
 
 ```
 perigpt/
-  model.py                  # All attention variants + GPT
+  model.py                  # All attention variants (standard, peri, state, SWA, hybrid) + GPT
   block_attn_res.py         # Block AttnRes + Kimi + DenseFormer baselines
+  peri_flex.py              # FlexAttention-based peridynamic attention (experimental)
   deer_parallel.py          # DEER parallel forward + associative scan
-  train.py                  # Training loop (CUDA/MPS/CPU)
-  sample.py                 # Text generation
-  analyze_damage.py         # Damage vs domain boundary analysis
-  configurator.py           # Config system
-  nanoperigpt_colab.ipynb   # All experiments
+  train.py                  # Training loop (auto CUDA/MPS/CPU, results.tsv logging)
+  sample.py                 # Text generation from checkpoints
+  analyze_damage.py         # Damage vs domain boundary correlation analysis
+  configurator.py           # Config file + CLI override system
+  nanoperigpt_colab.ipynb   # All experiments in one notebook
   config/
-    baseline.py             # Standard attention, shakespeare
+    baseline.py             # Standard attention, shakespeare_char
     mixed_baseline.py       # Standard attention, mixed-domain
   data/
     shakespeare_char/       # 1.1M chars, vocab 65
