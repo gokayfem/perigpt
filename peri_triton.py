@@ -29,8 +29,13 @@ except ImportError:
 if HAS_TRITON:
 
     @triton.jit
+    def _tanh(x):
+        e2x = tl.exp(2.0 * x)
+        return (e2x - 1.0) / (e2x + 1.0)
+
+    @triton.jit
     def _gelu_approx(x):
-        return 0.5 * x * (1.0 + tl.math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+        return 0.5 * x * (1.0 + _tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
     @triton.jit
     def _peri_attn_kernel(
@@ -122,8 +127,8 @@ if HAS_TRITON:
 
                 # Online softmax update (flash attention style)
                 m_new = tl.maximum(m_prev, logit)
-                scale = tl.math.exp(m_prev - m_new)
-                p_new = tl.math.exp(logit - m_new)
+                scale = tl.exp(m_prev - m_new)
+                p_new = tl.exp(logit - m_new)
 
                 d_prev = d_prev * scale + p_new
                 acc = acc * scale

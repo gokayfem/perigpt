@@ -28,8 +28,13 @@ except ImportError:
 if HAS_TRITON:
 
     @triton.jit
+    def _tanh(x):
+        e2x = tl.exp(2.0 * x)
+        return (e2x - 1.0) / (e2x + 1.0)
+
+    @triton.jit
     def _gelu_approx(x):
-        return 0.5 * x * (1.0 + tl.math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+        return 0.5 * x * (1.0 + _tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
     @triton.autotune(
         configs=[
@@ -204,12 +209,12 @@ if HAS_TRITON:
                 # Online softmax update for this tile
                 tile_max = tl.max(logits)
                 m_new = tl.maximum(m_prev, tile_max)
-                scale = tl.math.exp(m_prev - m_new)
+                scale = tl.exp(m_prev - m_new)
                 d_prev = d_prev * scale
                 acc = acc * scale
 
                 # Compute exp(logit - m_new) for each neighbor in tile
-                p_tile = tl.math.exp(logits - m_new)  # (BLOCK_DELTA,)
+                p_tile = tl.exp(logits - m_new)  # (BLOCK_DELTA,)
                 p_tile = tl.where(valid_mask, p_tile, 0.0)
                 d_prev += tl.sum(p_tile)
 
