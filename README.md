@@ -302,9 +302,9 @@ No explicit separator tokens. Ground-truth domain labels saved for damage analys
 ## Citation
 
 ```bibtex
-@misc{perigpt2026,
+@misc{aydogan2026perigpt,
   title={PeriGPT: Peridynamic Attention for Heterogeneous Sequence Modeling},
-  author={},
+  author={Aydoğan, Gökay},
   year={2026},
   url={https://github.com/gokayfem/perigpt}
 }
