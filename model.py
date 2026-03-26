@@ -295,21 +295,24 @@ class PeriDynamicAttention(nn.Module):
         disp = self.W_disp(x).view(B, T, nh, bd).permute(0, 2, 1, 3)   # (B, nh, T, bd)
         val  = self.W_val(x).view(B, T, nh, hs).permute(0, 2, 1, 3)    # (B, nh, T, hs)
 
-        # ---- build displacement windows only (NOT value windows) -----------
-        disp_win = self._build_windows(disp, delta)   # (B, nh, T, δ, bd)
-
         t_idx = torch.arange(T, device=x.device).unsqueeze(1)
         w_idx = torch.arange(delta, device=x.device).unsqueeze(0)
         cmask = (t_idx - delta + 1 + w_idx) >= 0      # (T, δ)
 
-        # ---- strain  (relative deformation) --------------------------------
-        strain = disp_win - disp.unsqueeze(3)          # (B, nh, T, δ, bd)
-
-        # ---- fused bond + damage projection --------------------------------
+        # ---- LINEARITY TRICK: pre-project, then window, then subtract ------
+        # Instead of: window(disp) → subtract → strain_fused(strain)  [huge 5D matmul]
+        # Do: strain_fused(disp) → window(projected) → subtract       [small 2D matmul]
+        # This exploits: W @ (disp_j - disp_i) = W @ disp_j - W @ disp_i
+        # Eliminates the 51 GFLOP matmul on (B*nh*T*delta, bd) × (bd, 2*bd)
+        # Replaces with a (B*nh*T, bd) × (bd, 2*bd) matmul — delta times smaller.
         rel_ids = torch.arange(delta, device=x.device)
         pos_feat = self.pos_proj(self.rel_pos_emb(rel_ids))  # (δ, bd)
 
-        fused = self.strain_fused(strain)              # (B, nh, T, δ, 2*bd)
+        proj_disp = F.linear(disp, self.strain_fused.weight, None)  # (B, nh, T, 2*bd)
+        proj_win = self._build_windows(proj_disp, delta)   # (B, nh, T, δ, 2*bd)
+        proj_i = proj_disp.unsqueeze(3)                     # (B, nh, T, 1, 2*bd)
+        fused = proj_win - proj_i + self.strain_fused.bias  # (B, nh, T, δ, 2*bd)
+
         bond_feats, damage_feats = fused.chunk(2, dim=-1)  # each (B, nh, T, δ, bd)
 
         bond_logits = self.bond_out(F.gelu(bond_feats + pos_feat)).squeeze(-1)
