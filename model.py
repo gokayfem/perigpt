@@ -230,22 +230,16 @@ class PeriDynamicAttention(nn.Module):
         # Encodes the *reference configuration* geometry within the horizon
         self.rel_pos_emb = nn.Embedding(self.horizon, bd)
 
-        # ---------- bond force / score function  (the "micro-modulus") ----------
-        # Maps strain features + positional features → scalar bond score.
-        # Factorised to avoid concatenating large tensors:
-        #   score = Linear( GELU( strain_proj(strain) + pos_proj(rel_pos) ) )
-        self.strain_proj = nn.Linear(bd, bd, bias=config.bias)
-        self.pos_proj    = nn.Linear(bd, bd, bias=False)       # no bias; absorbed by strain_proj
-        self.bond_out    = nn.Linear(bd, 1, bias=config.bias)
+        # ---------- fused bond + damage projection ----------
+        # Instead of separate strain_proj and damage_proj (two 5D linear ops),
+        # fuse into one: strain -> (bond_features, damage_features) in one matmul.
+        self.strain_fused = nn.Linear(bd, bd * 2, bias=True)   # -> [bond_feats, damage_feats]
+        self.pos_proj     = nn.Linear(bd, bd, bias=False)
 
-        # ---------- damage function  (bond breaking) ----------
-        # Learns when the "semantic strain" between two tokens exceeds a
-        # critical threshold → the bond breaks → adaptive sparsity.
-        # Outputs a scalar damage ∈ [0, 1] per bond.
-        # Always use bias here — the bias init controls starting damage level.
-        self.damage_proj = nn.Linear(bd, bd, bias=True)
-        self.damage_out  = nn.Linear(bd, 1, bias=True)
-        # Initialise so bonds start mostly intact:  sigmoid(−3) ≈ 0.047
+        # Fused output: (bond_feats, damage_feats) -> (bond_logit, damage_logit)
+        self.bond_out     = nn.Linear(bd, 1, bias=config.bias)
+        self.damage_out   = nn.Linear(bd, 1, bias=True)
+        # Initialise so bonds start mostly intact:  sigmoid(-3) ~ 0.047
         nn.init.constant_(self.damage_out.bias, -3.0)
 
         # ---------- output projection ----------
@@ -290,59 +284,46 @@ class PeriDynamicAttention(nn.Module):
         disp = self.W_disp(x).view(B, T, nh, bd).permute(0, 2, 1, 3)   # (B, nh, T, bd)
         val  = self.W_val(x).view(B, T, nh, hs).permute(0, 2, 1, 3)    # (B, nh, T, hs)
 
-        # ---- build causal windows ------------------------------------------
+        # ---- build displacement windows only (NOT value windows) -----------
         disp_win = self._build_windows(disp, delta)   # (B, nh, T, δ, bd)
-        val_win  = self._build_windows(val,  delta)    # (B, nh, T, δ, hs)
+        # val_win is NOT built — saves the largest intermediate tensor
 
-        # causal mask — (T, δ) bool, True = valid
         cmask = self._causal_mask(T, delta, x.device)  # (T, δ)
 
-        # ---- strain  (the core peridynamic quantity) -----------------------
-        #   ε_{ij} = disp_j − disp_i
-        # This is the *relative deformation*: the interaction depends on how
-        # much the two points have moved relative to each other — NOT on their
-        # absolute positions.  This gives translational invariance in feature
-        # space, analogous to material-frame indifference in mechanics.
+        # ---- strain  (relative deformation) --------------------------------
         disp_i = disp.unsqueeze(3)                     # (B, nh, T, 1, bd)
         strain = disp_win - disp_i                     # (B, nh, T, δ, bd)
 
-        # ---- relative position embedding -----------------------------------
+        # ---- fused bond + damage projection --------------------------------
+        # One matmul instead of two: strain -> [bond_feats, damage_feats]
         rel_ids = torch.arange(delta, device=x.device)
         rel_emb = self.rel_pos_emb(rel_ids)            # (δ, bd)
+        pos_feat = self.pos_proj(rel_emb)              # (δ, bd)
 
-        # ---- bond score  (micro-modulus / constitutive law) ----------------
-        # Factorised:  score = w^T · GELU( W_s · strain + W_p · rel_pos )
-        # Avoids materialising a (B,nh,T,δ,2·bd) concatenation.
-        strain_feat = self.strain_proj(strain)          # (B, nh, T, δ, bd)
-        pos_feat    = self.pos_proj(rel_emb)            # (δ, bd)  — broadcasts
-        bond_act    = F.gelu(strain_feat + pos_feat)    # (B, nh, T, δ, bd)
-        bond_logits = self.bond_out(bond_act).squeeze(-1)  # (B, nh, T, δ)
+        fused = self.strain_fused(strain)              # (B, nh, T, δ, 2*bd)
+        bond_feats, damage_feats = fused.chunk(2, dim=-1)  # each (B, nh, T, δ, bd)
 
-        # ---- damage  (adaptive bond breaking) -----------------------------
-        # Damage is a function of the strain magnitude.  High damage → the
-        # bond is "broken" → its contribution is suppressed.  This is the
-        # peridynamic mechanism for handling discontinuities (cracks).
-        # In language: semantic boundaries, topic shifts, clause breaks.
-        damage_act  = F.gelu(self.damage_proj(strain))     # (B, nh, T, δ, bd)
-        damage      = torch.sigmoid(self.damage_out(damage_act).squeeze(-1))
-        # damage ∈ [0, 1];  0 = intact,  1 = fully broken
+        bond_logits = self.bond_out(F.gelu(bond_feats + pos_feat)).squeeze(-1)
+        damage = torch.sigmoid(self.damage_out(F.gelu(damage_feats)).squeeze(-1))
 
-        # Suppress broken bonds by subtracting a large penalty from their logits
         bond_logits = bond_logits - damage * 10.0
-
-        # Apply causal mask  (padded / future positions → −inf)
         bond_logits = bond_logits.masked_fill(
             ~cmask.unsqueeze(0).unsqueeze(0), float('-inf')
         )
 
-        # ---- normalise via softmax  (peridynamic "volume correction") ------
         weights = F.softmax(bond_logits, dim=-1)        # (B, nh, T, δ)
         weights = self.attn_dropout(weights)
 
-        # ---- peridynamic integral: aggregate values over horizon -----------
-        # output_i = ∫_{H(i)} weight_{ij} · value_j  dV_j
-        output = torch.einsum('bntd,bntde->bnte', weights, val_win)
-        # → (B, nh, T, hs)
+        # ---- shift-accumulate value aggregation ----------------------------
+        # Instead of building val_win (B, nh, T, δ, hs) — which is the
+        # largest tensor — compute the weighted sum via shifted pointwise ops.
+        # output[t] = Σ_j weight[t,j] * val[t - δ + 1 + j]
+        # Memory: O(B*nh*T*hs) instead of O(B*nh*T*δ*hs) — δx reduction.
+        output = torch.zeros(B, nh, T, hs, device=x.device, dtype=val.dtype)
+        val_padded = F.pad(val, (0, 0, delta - 1, 0))  # (B, nh, T+δ-1, hs)
+        for j in range(delta):
+            w_j = weights[:, :, :, j].unsqueeze(-1)     # (B, nh, T, 1)
+            output = output + w_j * val_padded[:, :, j:j + T]  # (B, nh, T, hs)
 
         # ---- reshape and project -------------------------------------------
         output = output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
@@ -360,11 +341,11 @@ class PeriDynamicAttention(nn.Module):
         disp_win = self._build_windows(disp, delta)
         strain   = disp_win - disp.unsqueeze(3)
 
-        damage_act = F.gelu(self.damage_proj(strain))
-        damage     = torch.sigmoid(self.damage_out(damage_act).squeeze(-1))
-        cmask      = self._causal_mask(T, delta, x.device).float()
+        fused = self.strain_fused(strain)
+        _, damage_feats = fused.chunk(2, dim=-1)
+        damage = torch.sigmoid(self.damage_out(F.gelu(damage_feats)).squeeze(-1))
+        cmask  = self._causal_mask(T, delta, x.device).float()
 
-        # mean damage per head, only over valid (non-padded) bonds
         valid_count = cmask.sum()
         mean_damage = (damage * cmask.unsqueeze(0).unsqueeze(0)).sum() / (
             valid_count * B * nh + 1e-8

@@ -81,8 +81,13 @@ def get_per_position_damage(model, x):
                 disp_win = attn._build_windows(disp, delta)
                 strain = disp_win - disp.unsqueeze(3)
 
-                damage_act = torch.nn.functional.gelu(attn.damage_proj(strain))
-                damage = torch.sigmoid(attn.damage_out(damage_act).squeeze(-1))
+                if hasattr(attn, 'strain_fused'):
+                    fused = attn.strain_fused(strain)
+                    _, damage_feats = fused.chunk(2, dim=-1)
+                    damage = torch.sigmoid(attn.damage_out(torch.nn.functional.gelu(damage_feats)).squeeze(-1))
+                else:
+                    damage_act = torch.nn.functional.gelu(attn.damage_proj(strain))
+                    damage = torch.sigmoid(attn.damage_out(damage_act).squeeze(-1))
                 # damage: (B, nh, T, delta)
 
                 # Average over batch and heads
