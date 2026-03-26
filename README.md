@@ -174,20 +174,21 @@ Benchmarked on NVIDIA RTX 6000 Pro (Blackwell), B=64, T=256, 6 layers, h=128:
 
 | Method | ms/step | vs flash attention |
 |---|---|---|
-| Standard (flash attention) | 9.9 | 1.0x |
-| Standard + torch.compile | 9.4 | 0.95x |
-| Sliding window h=128 | 13.9 | 1.4x |
-| **Peridynamic + torch.compile** | **50.1** | **5.0x** |
-| Peridynamic (no compile) | 116.2 | 11.7x |
+| Standard (flash attention) | 9.96 | 1.00x |
+| Standard + torch.compile | 9.44 | 0.95x |
+| **Peridynamic + torch.compile** | **13.78** | **1.38x** |
+| Sliding window h=128 | 13.88 | 1.39x |
+| Peridynamic (no optimizations) | 130.26 | 13.1x |
 
-`torch.compile` gives a **2.3x speedup** on peridynamic attention by fusing elementwise operations (strain subtraction, GELU, damage sigmoid, masking) while keeping cuBLAS for the matrix multiplies.
+Peridynamic attention runs at **1.38x the cost of flash attention** — on par with sliding window attention — while providing strain-based scoring and damage mechanics that discover domain boundaries. This is a **9.5x speedup** from the unoptimized baseline.
 
-The 5x overhead vs flash attention is the irreducible cost of strain-based scoring + damage mechanics — more math per token-pair than a dot product. The extra computation buys the damage-at-boundaries capability that standard attention lacks.
+**Key optimization: the linearity trick.**
+The strain projection `W @ (disp_j - disp_i)` is linear, so it equals `W @ disp_j - W @ disp_i`. Instead of building the 5D strain tensor and then projecting (a 51 GFLOP matmul on 12.6M rows), we project the displacement first (a 0.4 GFLOP matmul on 98K rows), window the projected result, then subtract. This is delta times fewer FLOPs for the same output.
 
-**Optimizations applied:**
-- Fused strain + damage projections (one matmul instead of two on 5D tensors)
-- Strided-view value aggregation on GPU (zero-copy windowed matmul, no 5D val_win tensor)
-- Shift-accumulate fallback on CPU (128 contiguous-slice ops vs one non-contiguous einsum)
+**All optimizations applied:**
+- **Linearity trick**: pre-project displacement, then window + subtract (eliminates 51 GFLOP 5D matmul)
+- Fused strain + damage projections (one matmul instead of two)
+- Strided-view value aggregation on GPU (zero-copy windowed matmul)
 - `torch.compile(mode='max-autotune')` for elementwise op fusion
 
 ---
