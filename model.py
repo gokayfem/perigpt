@@ -242,14 +242,9 @@ class PeriDynamicAttention(nn.Module):
         # Initialise so bonds start mostly intact:  sigmoid(-3) ~ 0.047
         nn.init.constant_(self.damage_out.bias, -3.0)
 
-        # ---------- fused input projection ----------
-        # Instead of 3 separate matmuls (W_disp, F.linear(W_fused), W_val),
-        # fuse into one: x → (proj_disp_flat, val_flat) in a single matmul.
-        # proj_disp = x @ W_disp^T @ W_fused^T  (C → nh*bd → nh*2*bd, composable)
-        # val = x @ W_val^T                       (C → C)
-        # Combined: x @ W_all^T where W_all is (nh*2*bd + C, C)
-        # We keep the separate weights for training but pre-compute the fused version.
-        self._fused_weight = None  # lazily computed
+        # Note: W_disp and strain_fused are composed via the linearity trick
+        # in forward(): proj = F.linear(W_disp(x), W_fused.weight)
+        # This is 2 small matmuls that torch.compile can fuse.
 
         # ---------- output projection ----------
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -300,35 +295,14 @@ class PeriDynamicAttention(nn.Module):
         bd  = self.bond_dim
         delta = min(self.horizon, T)
 
-        # ---- fused input projection (3 matmuls → 1) -------------------------
-        # Compose W_disp and W_fused: x → proj_disp (nh*2*bd) and val (C) in one matmul.
-        # W_combined_proj = W_fused @ W_disp (per head), stacked with W_val.
-        if self._fused_weight is None or self.training:
-            # Recompute if training (weights change) or first call
-            # W_disp: (nh*bd, C), W_fused: (2*bd, bd) — compose per-head
-            W_disp_per_head = self.W_disp.weight.view(nh, bd, C)       # (nh, bd, C)
-            W_composed = torch.bmm(
-                self.strain_fused.weight.unsqueeze(0).expand(nh, -1, -1),  # (nh, 2*bd, bd)
-                W_disp_per_head                                             # (nh, bd, C)
-            ).reshape(nh * 2 * bd, C)                                      # (nh*2*bd, C)
-            # Stack with W_val: (nh*2*bd + C, C)
-            W_all = torch.cat([W_composed, self.W_val.weight], dim=0)      # (nh*2*bd + C, C)
-            if not self.training:
-                self._fused_weight = W_all
-        else:
-            W_all = self._fused_weight
+        # ---- input projections -----------------------------------------------
+        # Two matmuls: disp projection (small) + val projection (standard).
+        # The linearity trick composes W_disp and W_fused into one step.
+        disp = self.W_disp(x).view(B, T, nh, bd).permute(0, 2, 1, 3)   # (B, nh, T, bd)
+        val = self.W_val(x).view(B, T, nh, hs).permute(0, 2, 1, 3)     # (B, nh, T, hs)
 
-        # Single matmul: x @ W_all^T → (B, T, nh*2*bd + C)
-        all_proj = F.linear(x, W_all)                     # (B, T, nh*2*bd + C)
-        proj_flat = all_proj[:, :, :nh * 2 * bd]          # (B, T, nh*2*bd)
-        val_flat = all_proj[:, :, nh * 2 * bd:]           # (B, T, C)
-
-        proj_disp = proj_flat.view(B, T, nh, 2 * bd).permute(0, 2, 1, 3)  # (B, nh, T, 2*bd)
-        val = val_flat.view(B, T, nh, hs).permute(0, 2, 1, 3)             # (B, nh, T, hs)
-
-        # Add val bias if present
-        if self.W_val.bias is not None:
-            val = val + self.W_val.bias.view(1, nh, 1, hs)
+        # Pre-project displacement through strain_fused (small 2D matmul)
+        proj_disp = F.linear(disp, self.strain_fused.weight, None)  # (B, nh, T, 2*bd)
 
         t_idx = torch.arange(T, device=x.device).unsqueeze(1)
         w_idx = torch.arange(delta, device=x.device).unsqueeze(0)
